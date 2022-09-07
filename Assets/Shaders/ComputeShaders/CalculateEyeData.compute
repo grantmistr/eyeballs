@@ -1,0 +1,115 @@
+#pragma kernel CSMain // 0
+
+#define PI 3.14159265359
+#define FRUSTUM_CULL 1.5
+
+struct BufferData
+{
+    float4x4 transformMatrix;
+    float4x4 invTransformMatrix;
+    
+    float4 rotationData;
+    
+    float3 rotationMatrixX;
+    float3 rotationMatrixY;
+    float3 rotationMatrixZ;
+    
+    float blink;
+};
+
+RWStructuredBuffer<BufferData> _staticBuffer;
+AppendStructuredBuffer<BufferData> _dynamicBuffer;
+RWStructuredBuffer<float> _blinkOffsetBuffer;
+
+float _eyeRotationLimit, _blinkTime, _blinkFrequency, _farClipPlane;
+
+float3 _targetPosition, _cameraPosition;
+float4x4 _cameraVP;
+
+void RotationMatrixComponentsFromAxisAndAngle(float theta, float3 a, out float3 x, out float3 y, out float3 z)
+{
+    float s = sin(theta);
+    float c = cos(theta);
+    float t = 1 - c;
+    
+    x = float3(c + a.x * a.x * t, a.x * a.y * t - a.z * s, a.x * a.z * t + a.y * s);
+    y = float3(a.y * a.x * t + a.z * s, c + a.y * a.y * t, a.y * a.z * t - a.x * s);
+    z = float3(a.z * a.x * t - a.y * s, a.z * a.y * t + a.x * s, c + a.z * a.z * t);
+}
+
+float FastArcCos(float x)
+{
+    float theta = -0.6981317 * x;
+    theta *= x;
+    theta -= 0.8726646;
+    theta *= x;
+    theta += 1.570796;
+    return theta;
+}
+
+void CalculateRotationData(float3 position, inout BufferData bufferData)
+{
+    float3 forward = float3(0.0, 0.0, 1.0);
+    
+    float3 target = mul(bufferData.invTransformMatrix, float4(_targetPosition - position, 0.0)).xyz;
+    target = normalize(target);
+    
+    bufferData.rotationData.xyz = normalize(cross(target, forward));
+    
+    float w = dot(target, forward);
+    w = FastArcCos(w);
+    w = min(w, _eyeRotationLimit);
+    w *= -1.0;
+    bufferData.rotationData.w = w;
+    
+    RotationMatrixComponentsFromAxisAndAngle(w, bufferData.rotationData.xyz,
+    bufferData.rotationMatrixX, bufferData.rotationMatrixY, bufferData.rotationMatrixZ);
+}
+
+float CalculateBlink(uint tID)
+{
+    float blink = (_blinkTime + _blinkOffsetBuffer[tID]) % _blinkFrequency;
+    blink = PI - blink;
+    blink = max(blink, 0);
+    blink = sin(blink);
+    blink = 1 - blink;
+    return blink;
+}
+
+bool InView(float3 position, float3 clipSpace)
+{
+    bool inFrustum = (
+    clipSpace.x < -FRUSTUM_CULL ||
+    clipSpace.x > FRUSTUM_CULL ||
+    clipSpace.y < -FRUSTUM_CULL ||
+    clipSpace.y > FRUSTUM_CULL ||
+    clipSpace.z < -0.1) ? false : true;
+
+    bool inRange = distance(_cameraPosition, position) < _farClipPlane;
+
+    return inFrustum * inRange;
+}
+
+[numthreads(32,1,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    uint tID = id.x;
+    BufferData bufferData = _staticBuffer[tID];
+    
+    float4 position = float4(
+        bufferData.transformMatrix[0][3],
+        bufferData.transformMatrix[1][3],
+        bufferData.transformMatrix[2][3],
+        1.0);
+    
+    float4 viewSpace = mul(_cameraVP, position);
+    float3 clipSpace = viewSpace.xyz / -viewSpace.w;
+    clipSpace.z = -viewSpace.w;
+    
+    if (InView(position.xyz, clipSpace))
+    {
+        CalculateRotationData(position.xyz, bufferData);
+        bufferData.blink = CalculateBlink(tID);
+        _dynamicBuffer.Append(bufferData);
+    }
+}
